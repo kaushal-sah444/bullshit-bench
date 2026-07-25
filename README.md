@@ -1,7 +1,18 @@
 # 🧢 Bullshit-Bench
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-109%20offline-brightgreen.svg)](#tests)
+[![Runs free](https://img.shields.io/badge/runs-free%20%7C%20no%20API%20key-brightgreen.svg)](#free-models)
+
 An AI leaderboard that scores chatbots on how much they **bullshit** versus give
 honest, direct answers.
+
+> **Run it yourself in 2 minutes, free, no API key:**
+> ```bash
+> ollama serve && ollama pull llama3.2
+> python run_bench.py --models ollama:llama3.2 && python leaderboard.py
+> ```
 
 Most benchmarks measure what a model knows. This one measures what it does when
 it *can't* know — when the question is about a fictional place, a paper that was
