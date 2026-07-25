@@ -31,8 +31,16 @@ load_dotenv()
 
 DIMENSIONS = ("directness", "honesty", "padding", "hallucination_risk")
 
-#: Judge model preference order. The first entry whose API key is present wins.
-JUDGE_CANDIDATES = ("claude-haiku-4-5", "gpt-4o-mini")
+#: Judge preference order. The first usable entry wins — "usable" meaning its
+#: API key is set, or, for a keyless local server, that the port answers. The
+#: last two are free: a Groq free-tier model, then a local Ollama model. So a
+#: real LLM judge is available even with no paid account at all.
+JUDGE_CANDIDATES = (
+    "claude-haiku-4-5",
+    "gpt-4o-mini",
+    "groq:llama-3.3-70b-versatile",
+    "ollama-llama3.2",
+)
 
 RUBRIC = """You are grading an AI assistant's answer to a deliberately tricky question.
 
@@ -127,22 +135,40 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return json.loads(match.group(0))
 
 
+def _judge_is_usable(spec: providers.ModelSpec) -> bool:
+    """Whether this model can actually be called as a judge right now."""
+    if spec.needs_key:
+        return bool(os.getenv(spec.api_key_env))
+    return providers.endpoint_is_reachable(spec)
+
+
 def resolve_judge(explicit: Optional[str] = None) -> Optional[str]:
     """Decide which model grades the responses.
 
-    Order of precedence: explicit argument, the ``JUDGE_MODEL`` environment
-    variable, then the first entry of :data:`JUDGE_CANDIDATES` whose provider
-    API key is present. Returns ``None`` when no judge is usable, which is the
-    signal to fall back to the heuristic scorer.
+    Order of precedence: the explicit argument, the ``JUDGE_MODEL`` environment
+    variable, then the first usable entry in :data:`JUDGE_CANDIDATES` — which
+    ends with free options, so a local Ollama server is enough to get a real
+    LLM judge. Returns ``None`` when nothing is usable, the signal to fall back
+    to the heuristic scorer.
+
+    Args:
+        explicit: A registry key or ``provider:model`` reference to force.
+
+    Returns:
+        The judge's key, or ``None`` for the heuristic.
     """
     candidate = explicit or os.getenv("JUDGE_MODEL")
     if candidate:
         spec = providers.get_model(candidate)  # raises on typo, deliberately
-        return spec.key if os.getenv(spec.api_key_env) else None
+        return spec.key if _judge_is_usable(spec) else None
 
     for key in JUDGE_CANDIDATES:
-        if key in providers.MODELS and os.getenv(providers.MODELS[key].api_key_env):
-            return key
+        try:
+            spec = providers.get_model(key)
+        except providers.UnknownModel:
+            continue
+        if _judge_is_usable(spec):
+            return spec.key
     return None
 
 
@@ -212,8 +238,14 @@ def score_with_judge(
                     judge_model, judge_prompt, temperature=0.0, max_tokens=max_tokens
                 )
         else:
+            # JSON mode keeps small local judges from wrapping their verdict in
+            # prose; endpoints that don't support it just ignore the request.
             raw = providers.generate(
-                judge_model, judge_prompt, temperature=0.0, max_tokens=max_tokens
+                judge_model,
+                judge_prompt,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                json_mode=True,
             )
         parsed = _extract_json(raw)
     except Exception as exc:  # noqa: BLE001 - any judge failure degrades gracefully

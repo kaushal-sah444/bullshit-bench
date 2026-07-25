@@ -21,7 +21,7 @@ import json
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -64,16 +64,30 @@ class ModelSpec:
     Attributes:
         key: Stable identifier used in CLI flags, result files and the
             leaderboard. Keep it human-readable.
-        provider: One of ``anthropic``, ``openai``, ``google``.
+        provider: Adapter to use — ``anthropic``, ``google``, or
+            ``openai_compatible`` (which covers OpenAI itself plus Ollama,
+            OpenRouter, Groq, Together, DeepSeek, Mistral, xAI, LM Studio, vLLM
+            and anything else speaking the Chat Completions API).
         model_id: The identifier the provider's API expects.
         label: Display name for charts and tables.
-        api_key_env: Environment variable holding this provider's API key.
+        api_key_env: Environment variable holding the API key. **Empty means the
+            endpoint needs no key** — the normal case for a local server.
+        base_url: API root. ``None`` uses the SDK default.
+        base_url_env: Environment variable that overrides ``base_url``, so a
+            local server on a different host or port needs no code change.
         supports_temperature: ``False`` for models that reject sampling
             parameters (current Anthropic frontier models return HTTP 400 for
             ``temperature``/``top_p``/``top_k``; several OpenAI reasoning models
             behave the same way). The temperature is silently omitted for those.
+        supports_json_mode: Whether the endpoint accepts OpenAI-style
+            ``response_format={"type": "json_object"}``. Used to hold small local
+            judges to valid JSON.
         max_tokens_param: Name of the output-cap argument. OpenAI's newer models
             renamed ``max_tokens`` to ``max_completion_tokens``.
+        request_delay_s: Seconds to wait after each call. Free tiers meter
+            aggressively; pacing beats burning retries on 429s.
+        free: Whether running this model costs nothing (local, or a free tier).
+            Display only.
         enabled_by_default: Whether ``run_bench.py`` includes it when no
             ``--models`` flag is given.
     """
@@ -82,10 +96,116 @@ class ModelSpec:
     provider: str
     model_id: str
     label: str
-    api_key_env: str
+    api_key_env: str = ""
+    base_url: Optional[str] = None
+    base_url_env: str = ""
     supports_temperature: bool = True
+    supports_json_mode: bool = False
     max_tokens_param: str = "max_tokens"
+    request_delay_s: float = 0.0
+    free: bool = False
     enabled_by_default: bool = False
+
+    @property
+    def needs_key(self) -> bool:
+        """Whether this endpoint requires an API key at all."""
+        return bool(self.api_key_env)
+
+    def resolved_base_url(self) -> Optional[str]:
+        """Base URL after applying the environment override."""
+        return (os.getenv(self.base_url_env) if self.base_url_env else None) or self.base_url
+
+
+@dataclass(frozen=True)
+class ProviderPreset:
+    """Connection defaults for one platform, used by ``provider:model`` refs."""
+
+    provider: str
+    api_key_env: str = ""
+    base_url: Optional[str] = None
+    base_url_env: str = ""
+    supports_json_mode: bool = False
+    request_delay_s: float = 0.0
+    free: bool = False
+    label: str = ""
+
+
+# Anything speaking the OpenAI Chat Completions API is one entry here. This is
+# what makes `--models ollama:llama3.2` or `--models groq:<id>` work with no code
+# change: the alias before the colon picks the preset, the rest is the model id.
+PROVIDER_PRESETS: Dict[str, ProviderPreset] = {
+    # --- first-party -------------------------------------------------------- #
+    "openai": ProviderPreset(
+        provider="openai_compatible", api_key_env="OPENAI_API_KEY",
+        base_url_env="OPENAI_BASE_URL", supports_json_mode=True, label="OpenAI",
+    ),
+    "anthropic": ProviderPreset(
+        provider="anthropic", api_key_env="ANTHROPIC_API_KEY",
+        base_url_env="ANTHROPIC_BASE_URL", label="Anthropic",
+    ),
+    "google": ProviderPreset(
+        provider="google", api_key_env="GOOGLE_API_KEY",
+        base_url_env="GOOGLE_GENAI_BASE_URL", label="Google",
+    ),
+    # --- free: local, no key, no cost --------------------------------------- #
+    "ollama": ProviderPreset(
+        provider="openai_compatible", base_url="http://localhost:11434/v1",
+        base_url_env="OLLAMA_BASE_URL", supports_json_mode=True, free=True,
+        label="Ollama",
+    ),
+    "lmstudio": ProviderPreset(
+        provider="openai_compatible", base_url="http://localhost:1234/v1",
+        base_url_env="LMSTUDIO_BASE_URL", supports_json_mode=True, free=True,
+        label="LM Studio",
+    ),
+    "vllm": ProviderPreset(
+        provider="openai_compatible", base_url="http://localhost:8000/v1",
+        base_url_env="VLLM_BASE_URL", supports_json_mode=True, free=True,
+        label="vLLM",
+    ),
+    "llamacpp": ProviderPreset(
+        provider="openai_compatible", base_url="http://localhost:8080/v1",
+        base_url_env="LLAMACPP_BASE_URL", supports_json_mode=True, free=True,
+        label="llama.cpp",
+    ),
+    # --- hosted, with free tiers -------------------------------------------- #
+    "openrouter": ProviderPreset(
+        provider="openai_compatible", api_key_env="OPENROUTER_API_KEY",
+        base_url="https://openrouter.ai/api/v1", base_url_env="OPENROUTER_BASE_URL",
+        supports_json_mode=True, request_delay_s=3.0, label="OpenRouter",
+    ),
+    "groq": ProviderPreset(
+        provider="openai_compatible", api_key_env="GROQ_API_KEY",
+        base_url="https://api.groq.com/openai/v1", base_url_env="GROQ_BASE_URL",
+        supports_json_mode=True, request_delay_s=2.0, label="Groq",
+    ),
+    # --- other paid, OpenAI-compatible -------------------------------------- #
+    "deepseek": ProviderPreset(
+        provider="openai_compatible", api_key_env="DEEPSEEK_API_KEY",
+        base_url="https://api.deepseek.com/v1", base_url_env="DEEPSEEK_BASE_URL",
+        supports_json_mode=True, label="DeepSeek",
+    ),
+    "mistral": ProviderPreset(
+        provider="openai_compatible", api_key_env="MISTRAL_API_KEY",
+        base_url="https://api.mistral.ai/v1", base_url_env="MISTRAL_BASE_URL",
+        supports_json_mode=True, label="Mistral",
+    ),
+    "together": ProviderPreset(
+        provider="openai_compatible", api_key_env="TOGETHER_API_KEY",
+        base_url="https://api.together.xyz/v1", base_url_env="TOGETHER_BASE_URL",
+        supports_json_mode=True, label="Together",
+    ),
+    "xai": ProviderPreset(
+        provider="openai_compatible", api_key_env="XAI_API_KEY",
+        base_url="https://api.x.ai/v1", base_url_env="XAI_BASE_URL",
+        supports_json_mode=True, label="xAI",
+    ),
+    # --- escape hatch: anything else ---------------------------------------- #
+    "custom": ProviderPreset(
+        provider="openai_compatible", api_key_env="CUSTOM_API_KEY",
+        base_url_env="CUSTOM_BASE_URL", supports_json_mode=True, label="Custom",
+    ),
+}
 
 
 # The default roster is deliberately small: one current model per provider.
@@ -120,18 +240,22 @@ _BUILTIN_MODELS: List[ModelSpec] = [
     # --- OpenAI --------------------------------------------------------------
     ModelSpec(
         key="gpt-4o",
-        provider="openai",
+        provider="openai_compatible",
         model_id="gpt-4o",
         label="GPT-4o",
         api_key_env="OPENAI_API_KEY",
+        base_url_env="OPENAI_BASE_URL",
+        supports_json_mode=True,
         enabled_by_default=True,
     ),
     ModelSpec(
         key="gpt-4o-mini",
-        provider="openai",
+        provider="openai_compatible",
         model_id="gpt-4o-mini",
         label="GPT-4o mini",
         api_key_env="OPENAI_API_KEY",
+        base_url_env="OPENAI_BASE_URL",
+        supports_json_mode=True,
     ),
     # --- Google --------------------------------------------------------------
     ModelSpec(
@@ -148,6 +272,39 @@ _BUILTIN_MODELS: List[ModelSpec] = [
         model_id="gemini-1.5-pro",
         label="Gemini 1.5 Pro",
         api_key_env="GOOGLE_API_KEY",
+    ),
+    # --- Free: local models via Ollama --------------------------------------- #
+    # No key, no cost, no network. `ollama pull <model>` then benchmark it.
+    # Any other tag works too, without touching this file: `--models ollama:phi4`.
+    ModelSpec(
+        key="ollama-llama3.2",
+        provider="openai_compatible",
+        model_id="llama3.2",
+        label="Llama 3.2 (Ollama)",
+        base_url="http://localhost:11434/v1",
+        base_url_env="OLLAMA_BASE_URL",
+        supports_json_mode=True,
+        free=True,
+    ),
+    ModelSpec(
+        key="ollama-qwen2.5",
+        provider="openai_compatible",
+        model_id="qwen2.5",
+        label="Qwen 2.5 (Ollama)",
+        base_url="http://localhost:11434/v1",
+        base_url_env="OLLAMA_BASE_URL",
+        supports_json_mode=True,
+        free=True,
+    ),
+    ModelSpec(
+        key="ollama-mistral",
+        provider="openai_compatible",
+        model_id="mistral",
+        label="Mistral 7B (Ollama)",
+        base_url="http://localhost:11434/v1",
+        base_url_env="OLLAMA_BASE_URL",
+        supports_json_mode=True,
+        free=True,
     ),
 ]
 
@@ -187,13 +344,75 @@ def _load_models_json(path: Path = MODELS_JSON) -> None:
 _load_models_json()
 
 
+def spec_from_ref(ref: str) -> ModelSpec:
+    """Build a spec from an ad-hoc ``provider:model`` reference.
+
+    This is what lets the benchmark reach *any* model on a supported platform
+    without editing the registry::
+
+        ollama:llama3.2
+        openrouter:meta-llama/llama-3.3-70b-instruct:free
+        groq:llama-3.3-70b-versatile
+        custom:my-model            # with CUSTOM_BASE_URL set
+
+    Only the first colon splits — model ids may contain their own (OpenRouter's
+    ``:free`` suffix, for one).
+
+    Args:
+        ref: A ``alias:model_id`` string whose alias is in
+            :data:`PROVIDER_PRESETS`.
+
+    Returns:
+        A :class:`ModelSpec` keyed by the reference itself.
+
+    Raises:
+        UnknownModel: The alias is not a known platform, or the model id is
+            empty.
+    """
+    alias, _, model_id = ref.partition(":")
+    preset = PROVIDER_PRESETS.get(alias.lower())
+    if preset is None:
+        known = ", ".join(sorted(PROVIDER_PRESETS))
+        raise UnknownModel(f"Unknown platform {alias!r} in {ref!r}. Known: {known}")
+    if not model_id:
+        raise UnknownModel(f"{ref!r} is missing a model id (expected '{alias}:<model>')")
+
+    platform = preset.label or alias
+    return ModelSpec(
+        key=ref,
+        provider=preset.provider,
+        model_id=model_id,
+        label=f"{model_id} ({platform})",
+        api_key_env=preset.api_key_env,
+        base_url=preset.base_url,
+        base_url_env=preset.base_url_env,
+        supports_json_mode=preset.supports_json_mode,
+        request_delay_s=preset.request_delay_s,
+        # OpenRouter marks its no-cost models with a `:free` suffix.
+        free=preset.free or model_id.endswith(":free"),
+    )
+
+
 def get_model(key: str) -> ModelSpec:
-    """Look up a model spec by key."""
-    try:
+    """Look up a model spec by key, or build one from a ``provider:model`` ref.
+
+    Registry keys win over ad-hoc references, so a curated entry can shadow the
+    generic form.
+    """
+    if key in MODELS:
         return MODELS[key]
-    except KeyError:
-        known = ", ".join(sorted(MODELS))
-        raise UnknownModel(f"Unknown model {key!r}. Known models: {known}") from None
+
+    if ":" in key:
+        spec = spec_from_ref(key)
+        MODELS[key] = spec  # cache so later lookups (and results) agree
+        return spec
+
+    known = ", ".join(sorted(MODELS))
+    raise UnknownModel(
+        f"Unknown model {key!r}.\nRegistry: {known}\n"
+        f"Or use a platform reference like 'ollama:llama3.2' "
+        f"({', '.join(sorted(PROVIDER_PRESETS))})."
+    )
 
 
 def default_model_keys() -> List[str]:
@@ -202,11 +421,33 @@ def default_model_keys() -> List[str]:
 
 
 def available_model_keys() -> List[str]:
-    """Model keys whose provider API key is actually present in the env."""
-    return [key for key, spec in MODELS.items() if os.getenv(spec.api_key_env)]
+    """Model keys that are usable right now.
+
+    A model counts as usable when its API key is present, or when the endpoint
+    needs no key at all (a local server). Whether that local server is actually
+    running is a separate question — see :func:`endpoint_is_reachable`.
+    """
+    return [
+        key
+        for key, spec in MODELS.items()
+        if not spec.needs_key or os.getenv(spec.api_key_env)
+    ]
+
+
+def free_model_keys() -> List[str]:
+    """Registry keys that cost nothing to run."""
+    return [key for key, spec in MODELS.items() if spec.free]
 
 
 def _require_key(spec: ModelSpec) -> str:
+    """Return the API key for ``spec``, or a placeholder when none is needed.
+
+    Keyless endpoints (a local Ollama or LM Studio server) still need *something*
+    in the header for the OpenAI client, which rejects an empty api_key.
+    """
+    if not spec.needs_key:
+        return "not-needed"
+
     key = os.getenv(spec.api_key_env)
     if not key:
         raise MissingCredentials(
@@ -224,6 +465,14 @@ def _require_key(spec: ModelSpec) -> str:
 # --------------------------------------------------------------------------- #
 
 _clients: Dict[str, Any] = {}
+
+
+def _looks_like_bad_request(exc: BaseException) -> bool:
+    """Whether an SDK exception represents a 4xx the server chose to reject."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return 400 <= status < 500
+    return "unsupported" in str(exc).lower() or "unrecognized" in str(exc).lower()
 
 
 def _anthropic_client(spec: ModelSpec):
@@ -264,17 +513,42 @@ def _call_anthropic(spec: ModelSpec, prompt: str, temperature: float, max_tokens
 
 
 def _openai_client(spec: ModelSpec):
-    if "openai" not in _clients:
+    """Client for any Chat Completions endpoint.
+
+    Cached per (base URL, key variable) so OpenAI, a local Ollama server and
+    OpenRouter can all be in the same run without clobbering each other.
+    """
+    base_url = spec.resolved_base_url()
+    cache_key = f"openai:{base_url}:{spec.api_key_env}"
+    if cache_key not in _clients:
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise MissingDependency("pip install openai") from exc
-        _clients["openai"] = OpenAI(api_key=_require_key(spec))
-    return _clients["openai"]
+        kwargs: Dict[str, Any] = {"api_key": _require_key(spec)}
+        if base_url:
+            kwargs["base_url"] = base_url
+        _clients[cache_key] = OpenAI(**kwargs)
+    return _clients[cache_key]
 
 
-def _call_openai(spec: ModelSpec, prompt: str, temperature: float, max_tokens: int) -> str:
-    """Single-turn completion via the OpenAI Chat Completions API."""
+def _call_openai(
+    spec: ModelSpec,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    *,
+    json_mode: bool = False,
+) -> str:
+    """Single-turn completion via any OpenAI-compatible Chat Completions API.
+
+    Covers OpenAI itself plus Ollama, LM Studio, vLLM, llama.cpp, OpenRouter,
+    Groq, Together, DeepSeek, Mistral and xAI — they all speak this shape.
+
+    Args:
+        json_mode: Ask the endpoint to constrain output to valid JSON. Only used
+            for judge calls, and only where the spec says it is supported.
+    """
     client = _openai_client(spec)
     kwargs: Dict[str, Any] = {
         "model": spec.model_id,
@@ -283,8 +557,20 @@ def _call_openai(spec: ModelSpec, prompt: str, temperature: float, max_tokens: i
     }
     if spec.supports_temperature:
         kwargs["temperature"] = temperature
+    if json_mode and spec.supports_json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
 
-    response = client.chat.completions.create(**kwargs)
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - narrow retry for one known case
+        # Some self-hosted servers reject response_format outright. Losing JSON
+        # mode is far better than losing the call.
+        if "response_format" not in kwargs:
+            raise
+        if not _looks_like_bad_request(exc):
+            raise
+        kwargs.pop("response_format")
+        response = client.chat.completions.create(**kwargs)
     if not response.choices:
         raise EmptyResponse(f"{spec.key} returned no choices")
 
@@ -371,9 +657,10 @@ def _call_google(spec: ModelSpec, prompt: str, temperature: float, max_tokens: i
     return text
 
 
-_DISPATCH: Dict[str, Callable[[ModelSpec, str, float, int], str]] = {
+_DISPATCH: Dict[str, Callable[..., str]] = {
     "anthropic": _call_anthropic,
-    "openai": _call_openai,
+    "openai": _call_openai,  # kept as an alias for older models.json files
+    "openai_compatible": _call_openai,
     "google": _call_google,
 }
 
@@ -384,24 +671,65 @@ def generate(
     *,
     temperature: float = 0.7,
     max_tokens: int = 2048,
+    json_mode: bool = False,
 ) -> str:
     """Send ``prompt`` to ``model_key`` and return the response text.
 
     Args:
-        model_key: A key from the registry (see :data:`MODELS`).
+        model_key: A registry key (see :data:`MODELS`) or a ``provider:model``
+            reference such as ``ollama:llama3.2``.
         prompt: The user-turn text.
         temperature: Sampling temperature. Ignored for models whose spec sets
             ``supports_temperature=False``.
         max_tokens: Output cap.
+        json_mode: Request JSON-constrained output where the endpoint supports
+            it. Used by the judge; ignored by providers without the feature.
 
     Raises:
-        UnknownModel: ``model_key`` is not registered.
+        UnknownModel: ``model_key`` is neither registered nor a valid reference.
         MissingDependency: The provider SDK is not installed.
-        MissingCredentials: The provider's API key is not in the environment.
-        ProviderError: The provider returned nothing usable.
+        MissingCredentials: The endpoint needs an API key and none is set.
+        EmptyResponse: The call returned no usable text.
+        ProviderError: Any other provider-level problem.
     """
     spec = get_model(model_key)
     call = _DISPATCH.get(spec.provider)
     if call is None:
         raise ProviderError(f"No adapter for provider {spec.provider!r}")
+
+    if spec.provider in ("openai", "openai_compatible"):
+        return call(spec, prompt, temperature, max_tokens, json_mode=json_mode)
     return call(spec, prompt, temperature, max_tokens)
+
+
+_reachable_cache: Dict[str, bool] = {}
+
+
+def endpoint_is_reachable(spec: ModelSpec, timeout: float = 1.0) -> bool:
+    """Cheap liveness probe for a keyless local endpoint.
+
+    Used to decide whether a local model can act as the judge. Keyed endpoints
+    are assumed reachable — the presence of a key is the signal there, and
+    probing a paid API just to look would be rude. Results are cached per base
+    URL so a per-response judge lookup does not reopen a socket every time.
+    """
+    base_url = spec.resolved_base_url()
+    if spec.needs_key or not base_url:
+        return True
+    if base_url in _reachable_cache:
+        return _reachable_cache[base_url]
+
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            reachable = True
+    except OSError:
+        reachable = False
+
+    _reachable_cache[base_url] = reachable
+    return reachable

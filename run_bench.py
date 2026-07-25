@@ -144,6 +144,7 @@ def run_benchmark(
     judge_model: Optional[str] = None,
     do_score: bool = True,
     dry_run: bool = False,
+    delay: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Query every model with every prompt and score the answers.
 
@@ -157,6 +158,8 @@ def run_benchmark(
         dry_run: Skip every API call - both generation and judging - and emit
             placeholder text scored by the heuristic. Exercises the whole
             pipeline for free.
+        delay: Seconds to pause after each call, overriding each model's own
+            ``request_delay_s``. Raise it if a free tier rate-limits you.
 
     Returns:
         A run record: ``{run_id, started_at, config, records}``.
@@ -220,6 +223,11 @@ def run_benchmark(
                 finally:
                     record["latency_s"] = round(time.perf_counter() - start, 3)
 
+                # Free tiers meter hard; pacing costs less than burning retries.
+                pause = delay if delay is not None else spec.request_delay_s
+                if pause > 0:
+                    time.sleep(pause)
+
             if record["error"]:
                 print(f"  FAILED: {record['error']}")
                 records.append(record)
@@ -280,14 +288,31 @@ def save_run(run: Dict[str, Any], results_dir: Path = RESULTS_DIR) -> Path:
 
 
 def _print_registry() -> None:
-    print(f"{'KEY':<22} {'PROVIDER':<11} {'KEY SET':<8} DEFAULT  LABEL")
+    """Show the registry, what it costs, and whether it is usable right now."""
     available = set(providers.available_model_keys())
+    print(f"{'KEY':<22} {'COST':<6} {'USABLE':<8} {'DEFAULT':<8} ENDPOINT / KEY")
+    print("-" * 78)
     for key, spec in providers.MODELS.items():
+        if not spec.needs_key:
+            usable = "yes" if key in available else "no"
+            where = f"{spec.resolved_base_url()} (no key needed)"
+        else:
+            usable = "yes" if key in available else "no key"
+            where = spec.resolved_base_url() or spec.api_key_env
         print(
-            f"{key:<22} {spec.provider:<11} "
-            f"{'yes' if key in available else 'no':<8} "
-            f"{'yes' if spec.enabled_by_default else 'no':<8} {spec.label}"
+            f"{key:<22} {'free' if spec.free else 'paid':<6} {usable:<8} "
+            f"{('yes' if spec.enabled_by_default else '-'):<8} {where}"
         )
+
+    platforms = ", ".join(sorted(providers.PROVIDER_PRESETS))
+    print(
+        "\nAny model on a supported platform also works without being listed"
+        " here, via a platform reference:\n"
+        "  --models ollama:llama3.2              free, local, no key needed\n"
+        "  --models openrouter:<model>:free      free tier\n"
+        "  --models groq:<model>                 free tier\n"
+        f"Platforms: {platforms}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -325,6 +350,13 @@ def build_parser() -> argparse.ArgumentParser:
              "responses scored by the heuristic.",
     )
     parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help="Seconds to wait after each call. Overrides the model's own pacing; "
+             "useful when a free tier rate-limits you.",
+    )
+    parser.add_argument(
         "--list-models", action="store_true", help="Print the model registry and exit."
     )
     return parser
@@ -344,7 +376,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sys.exit("No models selected. Pass --models, or mark models enabled_by_default.")
 
     for key in model_keys:
-        providers.get_model(key)  # fail fast on a typo'd key
+        try:
+            providers.get_model(key)  # fail fast on a typo'd key or platform
+        except providers.UnknownModel as exc:
+            sys.exit(str(exc))
 
     if not args.dry_run:
         have_keys = set(providers.available_model_keys())
@@ -367,6 +402,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         judge_model=args.judge,
         do_score=not args.no_score,
         dry_run=args.dry_run,
+        delay=args.delay,
     )
     path = save_run(run, args.out)
 

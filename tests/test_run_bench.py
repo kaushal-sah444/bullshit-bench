@@ -156,5 +156,15 @@ def test_a_saved_run_round_trips_through_json(mock_env, tmp_path: Path):
 
 
 def test_cli_rejects_an_unknown_model_before_spending_anything(mock_env):
-    with pytest.raises(providers.UnknownModel):
+    with pytest.raises(SystemExit) as exc:
         run_bench.main(["--models", "not-a-real-model", "--dry-run"])
+    assert "Unknown model" in str(exc.value)
+
+
+def test_cli_rejects_an_unknown_platform_with_a_readable_message(mock_env):
+    """A typo'd platform should be a one-line error, not a traceback."""
+    with pytest.raises(SystemExit) as exc:
+        run_bench.main(["--models", "bogus:some-model", "--dry-run"])
+    message = str(exc.value)
+    assert "Unknown platform 'bogus'" in message
+    assert "ollama" in message  # lists what is valid

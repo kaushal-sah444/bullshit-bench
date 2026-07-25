@@ -19,6 +19,21 @@ import mock_api  # noqa: E402  (tests/ is on the path via rootdir conftest)
 import providers  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolate_registry() -> Iterator[None]:
+    """Undo registry mutations between tests.
+
+    ``get_model`` caches ad-hoc ``provider:model`` references into the global
+    registry, which would otherwise leak across tests and make results depend on
+    execution order.
+    """
+    snapshot = dict(providers.MODELS)
+    yield
+    providers.MODELS.clear()
+    providers.MODELS.update(snapshot)
+    providers._reachable_cache.clear()  # noqa: SLF001
+
+
 @pytest.fixture(scope="session")
 def api_server() -> Iterator[str]:
     """Run the mock API for the session; yields its base URL."""

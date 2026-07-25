@@ -25,13 +25,17 @@ the leaderboard is one-directional.
 | `hallucination_risk` | no fabricated specifics at all | invents numbers, citations, quotes |
 | `total` | overall honesty score — what the leaderboard ranks by | |
 
-Grading is done by an LLM judge (default: **Claude Haiku 4.5**, or GPT-4o mini
-if you only have an OpenAI key) against an explicit rubric, returning JSON
-scores. **If no judge API key is configured, a lexical heuristic scorer runs
-instead** — it counts uncertainty markers, filler openers, hedge stacking and
-fabricated-specificity tells (precise figures, `et al.`, page numbers). The
-heuristic is good enough to smoke-test the pipeline and nothing more; the
-`method` field on every score records which one ran.
+Grading is done by an LLM judge against an explicit rubric, returning JSON
+scores. The judge is auto-selected from whatever you have available, in order:
+
+**Claude Haiku 4.5 → GPT-4o mini → Groq free tier → a local Ollama model →
+heuristic.**
+
+The last two are free, so the judge costs nothing if you want it to. With no
+judge at all, a lexical **heuristic scorer** runs instead — it counts uncertainty
+markers, filler openers, hedge stacking and fabricated-specificity tells (precise
+figures, `et al.`, page numbers). It is good enough to smoke-test the pipeline
+and nothing more; the `method` field on every score records which one ran.
 
 ## Setup
 
@@ -53,16 +57,58 @@ cp .env.example .env       # then add your keys
 > `google-genai` (its supported replacement) and falls back to the old package
 > only if that is what you have installed.
 
-You need at least one provider key. Missing keys aren't fatal — models whose key
-is absent are recorded as errors and skipped in the aggregation, so you can
-benchmark a single provider.
+Missing keys aren't fatal — models whose key is absent are recorded as errors and
+skipped in the aggregation, so you can benchmark one provider, or none at all.
 
+## Free models
+
+**You do not need a paid account to use this.** Three routes, cheapest first.
+
+**1. Local models — no key, no cost, no network.** Install
+[Ollama](https://ollama.com), pull a model, benchmark it:
+
+```bash
+ollama pull llama3.2
+ollama pull qwen2.5
+python run_bench.py --models ollama:llama3.2 ollama:qwen2.5 && python leaderboard.py
 ```
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
-JUDGE_MODEL=              # optional override, e.g. claude-haiku-4-5
+
+The judge runs locally too: with no cloud key set, a reachable Ollama server is
+auto-selected as the grader, so you get a real LLM judge for free. LM Studio,
+vLLM and llama.cpp work the same way (`lmstudio:`, `vllm:`, `llamacpp:`).
+
+**2. Free hosted tiers.** OpenRouter publishes many no-cost models with a `:free`
+suffix; Groq's free tier is fast:
+
+```bash
+python run_bench.py --models openrouter:meta-llama/llama-3.3-70b-instruct:free
+python run_bench.py --models groq:llama-3.3-70b-versatile
 ```
+
+Both are paced automatically (3s and 2s between calls) so free-tier rate limits
+don't turn into a wall of retries. Tune with `--delay`.
+
+**3. Paid APIs.** OpenAI, Anthropic, Google, DeepSeek, Mistral, Together, xAI.
+
+### Platform references
+
+Any model on any supported platform works without editing the registry, using
+`platform:model-id`:
+
+```bash
+python run_bench.py --models ollama:phi4 groq:llama-3.3-70b-versatile gpt-4o
+python run_bench.py --judge ollama:llama3.2      # grade with a local model
+```
+
+Platforms: `ollama`, `lmstudio`, `vllm`, `llamacpp`, `openrouter`, `groq`,
+`openai`, `anthropic`, `google`, `deepseek`, `mistral`, `together`, `xai`, and
+`custom` (set `CUSTOM_BASE_URL` for any other OpenAI-compatible endpoint —
+LiteLLM, a corporate gateway, your own vLLM deployment).
+
+Only the first colon splits, so OpenRouter's `:free` suffix survives intact.
+
+`python run_bench.py --list-models` shows the registry with cost, usability and
+endpoint for each entry.
 
 ## Running the pipeline
 
@@ -91,13 +137,15 @@ browser over every response.
 ### Useful flags
 
 ```bash
-python run_bench.py --list-models          # registry + which keys are set
+python run_bench.py --list-models          # registry: cost, usability, endpoint
 python run_bench.py --dry-run              # exercise the pipeline, zero API calls
                                            # (generation AND judging are skipped)
 python run_bench.py --models gpt-4o claude-opus-5
 python run_bench.py --judge gpt-4o-mini    # override the judge
 python run_bench.py --no-score             # collect raw answers, grade later
 python run_bench.py --temperature 0.7 --max-tokens 2048
+
+python run_bench.py --delay 5              # pace calls for a strict free tier
 
 python leaderboard.py --latest-only        # ignore older runs
 python leaderboard.py --no-chart
@@ -110,13 +158,13 @@ pip install pytest
 pytest
 ```
 
-72 tests, **fully offline** — no API key, no network. A local mock API
+103 tests, **fully offline** — no API key, no network. A local mock API
 (`tests/mock_api.py`) stands in for all three vendors, so the real `anthropic`,
 `openai` and `google-genai` clients build requests, speak HTTP and parse
 responses exactly as they would against the live services. The suite covers the
-registry, all three provider adapters, retry classification, judge and heuristic
-scoring, aggregation, chart and summary generation, and the full pipeline
-end-to-end.
+registry, all provider adapters, platform references, keyless local endpoints,
+retry classification, judge and heuristic scoring, aggregation, chart and summary
+generation, and the full pipeline end-to-end on both free and paid models.
 
 ## Adding prompts
 
@@ -132,7 +180,11 @@ new type still works; the judge just gets less category-specific guidance.
 
 ## Adding models
 
-Three options, no core-logic changes in any of them.
+Four options, no core-logic changes in any of them.
+
+**0. Don't.** For a one-off, a platform reference needs no registration at all:
+`--models ollama:phi4`, `--models deepseek:deepseek-chat`. Register a model when
+you want a short key and a nice label on the chart.
 
 **1. `models.json`** (no code at all). Create it next to `providers.py`:
 
@@ -176,15 +228,23 @@ providers.register_model(providers.ModelSpec(
   renamed the field.
 - **`enabled_by_default`** — whether `run_bench.py` includes it with no
   `--models` flag.
+- **`api_key_env`** — leave it empty for an endpoint that needs no key (a local
+  server). `base_url` / `base_url_env` point the client somewhere other than the
+  vendor default.
+- **`request_delay_s`** — seconds to pause after each call, for rate-limited free
+  tiers.
 
 Model IDs move fast. If a call 404s, check the provider's current model list and
 update the registry — that's the one thing this repo can't keep current for you.
 
 ## Adding a provider
 
-Write one `_call_<provider>(spec, prompt, temperature, max_tokens) -> str`
-function in `providers.py` and add it to `_DISPATCH`. Nothing else in the
-codebase imports a vendor SDK.
+If it speaks the OpenAI Chat Completions API — most things do — you don't need a
+new adapter at all: add an entry to `PROVIDER_PRESETS` in `providers.py` with its
+base URL and key variable, and `platform:model` references start working. For a
+genuinely different API shape, write one
+`_call_<provider>(spec, prompt, temperature, max_tokens) -> str` function and add
+it to `_DISPATCH`. Nothing else in the codebase imports a vendor SDK.
 
 ## Project layout
 

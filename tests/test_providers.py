@@ -26,7 +26,11 @@ def test_missing_key_is_reported_not_retried(no_keys):
 
 
 def test_available_model_keys_tracks_the_environment(monkeypatch, no_keys):
-    assert providers.available_model_keys() == []
+    """Keyed models need their key; keyless local ones are always available."""
+    available = providers.available_model_keys()
+    assert "gpt-4o" not in available
+    assert "ollama-llama3.2" in available  # no key to be missing
+
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     available = providers.available_model_keys()
     assert "gpt-4o" in available
