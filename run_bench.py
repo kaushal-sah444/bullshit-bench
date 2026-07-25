@@ -8,7 +8,7 @@ Usage::
     python run_bench.py                          # default model roster
     python run_bench.py --models gpt-4o gemini-2.0-flash
     python run_bench.py --list-models            # show the registry
-    python run_bench.py --dry-run                # no API calls, canned answers
+    python run_bench.py --dry-run                # no API calls at all, canned answers
 """
 
 from __future__ import annotations
@@ -40,7 +40,15 @@ T = TypeVar("T")
 MAX_ATTEMPTS = 5
 BASE_DELAY = 2.0
 MAX_DELAY = 60.0
-_NON_RETRYABLE = (providers.MissingCredentials, providers.MissingDependency, providers.UnknownModel)
+
+# Deterministic failures: a second attempt cannot change the outcome, so raise
+# immediately instead of burning four more calls and ~60s of backoff.
+_NON_RETRYABLE = (
+    providers.MissingCredentials,
+    providers.MissingDependency,
+    providers.UnknownModel,
+    providers.EmptyResponse,
+)
 
 
 def load_prompts(path: Path = PROMPTS_PATH) -> List[Dict[str, str]]:
@@ -132,7 +140,7 @@ def run_benchmark(
     prompts: Sequence[Dict[str, str]],
     *,
     temperature: float = 0.7,
-    max_tokens: int = 1024,
+    max_tokens: int = 2048,
     judge_model: Optional[str] = None,
     do_score: bool = True,
     dry_run: bool = False,
@@ -146,19 +154,26 @@ def run_benchmark(
         max_tokens: Output cap per response.
         judge_model: Judge registry key, or ``None`` to auto-resolve.
         do_score: Set ``False`` to collect raw responses without grading.
-        dry_run: Skip API calls entirely and emit placeholder text. Useful for
-            exercising the pipeline before spending money.
+        dry_run: Skip every API call - both generation and judging - and emit
+            placeholder text scored by the heuristic. Exercises the whole
+            pipeline for free.
 
     Returns:
         A run record: ``{run_id, started_at, config, records}``.
     """
-    resolved_judge = scorer.resolve_judge(judge_model) if do_score else None
+    # A dry run must not spend money anywhere, and the judge is an API call too:
+    # grade with the heuristic scorer instead of quietly billing for 1 judge call
+    # per response.
+    resolved_judge = (
+        scorer.resolve_judge(judge_model) if do_score and not dry_run else None
+    )
     if do_score:
-        print(
-            f"Judge: {resolved_judge}"
-            if resolved_judge
-            else "Judge: none configured - falling back to the heuristic scorer."
-        )
+        if dry_run:
+            print("Judge: skipped for --dry-run - scoring with the heuristic.")
+        elif resolved_judge:
+            print(f"Judge: {resolved_judge}")
+        else:
+            print("Judge: none configured - falling back to the heuristic scorer.")
 
     started = datetime.now(timezone.utc)
     records: List[Dict[str, Any]] = []
@@ -212,15 +227,22 @@ def run_benchmark(
 
             if do_score:
                 try:
-                    result = with_retry(
-                        lambda: scorer.score(
+                    # `scorer.score(judge_model=None)` means "auto-resolve", which
+                    # would reach for a judge during a dry run - so call the
+                    # heuristic directly instead of relying on the None default.
+                    grade = (
+                        (lambda: scorer.score_heuristic(
+                            item["prompt"], record["response"], item["type"]
+                        ))
+                        if dry_run
+                        else (lambda: scorer.score(
                             item["prompt"],
                             record["response"],
                             item["type"],
                             judge_model=resolved_judge,
-                        ),
-                        description=f"judge {label}",
+                        ))
                     )
+                    result = with_retry(grade, description=f"judge {label}")
                     record["scores"] = result.to_dict()
                     print(f"  scored {result.total:.1f}/10")
                 except Exception as exc:  # noqa: BLE001
@@ -283,7 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", type=Path, default=RESULTS_DIR, help="Directory for run output."
     )
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature.")
-    parser.add_argument("--max-tokens", type=int, default=1024, help="Output cap per response.")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        help="Output cap per response. Models that think by default spend this "
+             "budget on reasoning before any visible text, so keep it generous.",
+    )
     parser.add_argument(
         "--judge", metavar="KEY", help="Judge model key (default: auto-resolve)."
     )
@@ -291,7 +319,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-score", action="store_true", help="Collect raw responses without grading them."
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Skip API calls; emit placeholder responses."
+        "--dry-run",
+        action="store_true",
+        help="Skip every API call (generation and judging); emit placeholder "
+             "responses scored by the heuristic.",
     )
     parser.add_argument(
         "--list-models", action="store_true", help="Print the model registry and exit."
@@ -316,7 +347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         providers.get_model(key)  # fail fast on a typo'd key
 
     if not args.dry_run:
-        unusable = [k for k in model_keys if k not in providers.available_model_keys()]
+        have_keys = set(providers.available_model_keys())
+        unusable = [k for k in model_keys if k not in have_keys]
         if unusable:
             print(
                 f"Warning: no API key for {', '.join(unusable)}. "

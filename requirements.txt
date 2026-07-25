@@ -7,7 +7,10 @@ kaleido>=0.2.1        # static PNG export for plotly
 # Provider SDKs — each is optional; a missing one only disables its models
 anthropic>=0.40
 openai>=1.40
-google-generativeai>=0.8
+google-genai>=1.0             # google-generativeai is EOL; legacy still works as a fallback
 
 # Optional dashboard (app.py)
 streamlit>=1.49          # width="stretch" replaces use_container_width
+
+# Tests (offline: a local mock API stands in for all three vendors)
+pytest>=8.0

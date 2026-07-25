@@ -148,6 +148,23 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def failed_models(df: pd.DataFrame) -> pd.DataFrame:
+    """Models that produced no scored response at all.
+
+    These are invisible in :func:`aggregate` — a model whose every call failed
+    has nothing to average — so they are surfaced separately rather than quietly
+    dropped off the leaderboard.
+    """
+    scored_models = set(df.loc[df["total"].notna(), "model"].unique())
+    dead = df[~df["model"].isin(scored_models)]
+    if dead.empty:
+        return dead.iloc[0:0]
+    return (
+        dead.groupby(["model", "model_label"], as_index=False)
+        .agg(failures=("error", "size"), first_error=("error", "first"))
+    )
+
+
 def write_csv(agg: pd.DataFrame, path: Path) -> Path:
     """Write the aggregated leaderboard to CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,6 +377,19 @@ def write_summary(df: pd.DataFrame, agg: pd.DataFrame, path: Path) -> Path:
             lines.append(f"*Judge:* {row.verdict}")
             lines.append("")
 
+    dead = failed_models(df)
+    if not dead.empty:
+        lines.append("## Models with no usable responses")
+        lines.append("")
+        lines.append(
+            "These are absent from the leaderboard above — every call failed, so "
+            "there is nothing to average."
+        )
+        lines.append("")
+        for row in dead.itertuples():
+            lines.append(f"- **{row.model_label}** ({row.failures} failures): {row.first_error}")
+        lines.append("")
+
     failures = df[df["error"].notna()]
     if not failures.empty:
         lines.append("## Failures")
@@ -408,6 +438,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print()
     print(agg[["rank", "model_label", "total", "responses", "errors"]].to_string(index=False))
+
+    dead = failed_models(df)
+    if not dead.empty:
+        print("\nNot ranked (no usable responses):")
+        for row in dead.itertuples():
+            print(f"  {row.model_label}: {row.failures} failures - {row.first_error}")
     return 0
 
 

@@ -46,6 +46,17 @@ class UnknownModel(ProviderError):
     """The requested model key is not in the registry."""
 
 
+class EmptyResponse(ProviderError):
+    """The call succeeded but carried no usable text.
+
+    Usually means the output budget was exhausted before any visible text was
+    produced (models that think by default spend ``max_tokens`` on reasoning
+    first), or the provider blocked the response. Deterministic, so it is not
+    retried — raise ``--max-tokens`` instead. Recorded as an error rather than
+    scored, because grading an empty string as 0/10 would invent a result.
+    """
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """Everything the benchmark needs to know about one model.
@@ -239,7 +250,17 @@ def _call_anthropic(spec: ModelSpec, prompt: str, temperature: float, max_tokens
     message = client.messages.create(**kwargs)
     # `content` is a list of blocks; thinking blocks (when the model thinks by
     # default) carry no visible text, so filter to text blocks.
-    return "".join(block.text for block in message.content if block.type == "text").strip()
+    text = "".join(
+        block.text for block in message.content if getattr(block, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise EmptyResponse(
+            f"{spec.key} returned no text (stop_reason="
+            f"{getattr(message, 'stop_reason', None)!r}). Models that think by "
+            "default spend max_tokens on reasoning first - retry with a larger "
+            "--max-tokens."
+        )
+    return text
 
 
 def _openai_client(spec: ModelSpec):
@@ -264,37 +285,90 @@ def _call_openai(spec: ModelSpec, prompt: str, temperature: float, max_tokens: i
         kwargs["temperature"] = temperature
 
     response = client.chat.completions.create(**kwargs)
-    return (response.choices[0].message.content or "").strip()
+    if not response.choices:
+        raise EmptyResponse(f"{spec.key} returned no choices")
+
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    if not text:
+        raise EmptyResponse(
+            f"{spec.key} returned no text (finish_reason="
+            f"{getattr(choice, 'finish_reason', None)!r}). If it is 'length', "
+            "retry with a larger --max-tokens."
+        )
+    return text
 
 
-def _google_model(spec: ModelSpec):
+def _google_client(spec: ModelSpec):
+    """Return ``(sdk_kind, handle)`` for Google, preferring the current SDK.
+
+    ``google-generativeai`` reached end of life and no longer receives updates,
+    so ``google-genai`` is tried first and the old package is only a fallback for
+    environments still pinned to it. The two have different call shapes, hence
+    the tag.
+    """
     cache_key = f"google:{spec.model_id}"
-    if cache_key not in _clients:
+    if cache_key in _clients:
+        return _clients[cache_key]
+
+    api_key = _require_key(spec)
+    try:
+        from google import genai  # google-genai (current)
+
+        # The Anthropic and OpenAI SDKs pick up ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+        # on their own; google-genai has no equivalent, so wire one up for parity
+        # (useful for proxies and gateways, and for pointing tests at a stub).
+        base_url = os.getenv("GOOGLE_GENAI_BASE_URL")
+        http_options = {"base_url": base_url} if base_url else None
+        _clients[cache_key] = (
+            "genai",
+            genai.Client(api_key=api_key, http_options=http_options),
+        )
+    except ImportError:
         try:
-            import google.generativeai as genai
+            import google.generativeai as legacy  # google-generativeai (EOL)
         except ImportError as exc:
-            raise MissingDependency("pip install google-generativeai") from exc
-        genai.configure(api_key=_require_key(spec))
-        _clients[cache_key] = genai.GenerativeModel(spec.model_id)
+            raise MissingDependency("pip install google-genai") from exc
+        legacy.configure(api_key=api_key)
+        _clients[cache_key] = ("legacy", legacy.GenerativeModel(spec.model_id))
+
     return _clients[cache_key]
 
 
 def _call_google(spec: ModelSpec, prompt: str, temperature: float, max_tokens: int) -> str:
-    """Single-turn completion via the Google Generative AI SDK."""
-    model = _google_model(spec)
+    """Single-turn completion via the Google GenAI SDK."""
+    kind, handle = _google_client(spec)
     config: Dict[str, Any] = {"max_output_tokens": max_tokens}
     if spec.supports_temperature:
         config["temperature"] = temperature
 
-    response = model.generate_content(prompt, generation_config=config)
+    if kind == "genai":
+        response = handle.models.generate_content(
+            model=spec.model_id, contents=prompt, config=config
+        )
+    else:
+        response = handle.generate_content(prompt, generation_config=config)
+
+    text = ""
     try:
-        return (response.text or "").strip()
+        text = (response.text or "").strip()
     except (ValueError, AttributeError):
-        # `.text` raises when the response was blocked or has no text parts.
-        parts = getattr(getattr(response, "candidates", [None])[0], "content", None)
-        if parts is None:
-            raise ProviderError(f"{spec.key} returned no usable content") from None
-        return "".join(getattr(p, "text", "") for p in parts.parts).strip()
+        # `.text` raises when the response was blocked or has no text parts;
+        # fall back to walking the first candidate's parts by hand.
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", None) or []
+            text = "".join(getattr(part, "text", "") or "" for part in parts).strip()
+
+    if not text:
+        reason = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+        raise EmptyResponse(
+            f"{spec.key} returned no text"
+            + (f" (block_reason={reason!r})" if reason else "")
+            + ". If the finish reason was the token cap, retry with a larger --max-tokens."
+        )
+    return text
 
 
 _DISPATCH: Dict[str, Callable[[ModelSpec, str, float, int], str]] = {
@@ -309,7 +383,7 @@ def generate(
     prompt: str,
     *,
     temperature: float = 0.7,
-    max_tokens: int = 1024,
+    max_tokens: int = 2048,
 ) -> str:
     """Send ``prompt`` to ``model_key`` and return the response text.
 

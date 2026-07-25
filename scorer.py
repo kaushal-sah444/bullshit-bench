@@ -155,14 +155,21 @@ def _judge_anthropic_structured(
     the caller falls back to a plain call if this raises.
     """
     client = providers._anthropic_client(spec)  # noqa: SLF001 - same package
-    message = client.messages.create(
-        model=spec.model_id,
-        max_tokens=max_tokens,
-        temperature=0,
-        messages=[{"role": "user", "content": judge_prompt}],
-        output_config={"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
+    kwargs: Dict[str, Any] = {
+        "model": spec.model_id,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": judge_prompt}],
+        "output_config": {"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
+    }
+    # Judges should be deterministic, but models that reject sampling params
+    # return 400 for any temperature at all - including 0.
+    if spec.supports_temperature:
+        kwargs["temperature"] = 0
+
+    message = client.messages.create(**kwargs)
+    return "".join(
+        b.text for b in message.content if getattr(b, "type", None) == "text"
     )
-    return "".join(b.text for b in message.content if b.type == "text")
 
 
 def score_with_judge(
@@ -171,7 +178,7 @@ def score_with_judge(
     prompt_type: str,
     judge_model: str,
     *,
-    max_tokens: int = 512,
+    max_tokens: int = 1024,
 ) -> Score:
     """Grade one response with an LLM judge.
 

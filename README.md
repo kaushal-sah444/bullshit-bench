@@ -48,6 +48,11 @@ pip install -r requirements.txt
 cp .env.example .env       # then add your keys
 ```
 
+> **Google SDK note.** The original spec called for `google-generativeai`, but that
+> package has reached end of life and no longer receives updates. This uses
+> `google-genai` (its supported replacement) and falls back to the old package
+> only if that is what you have installed.
+
 You need at least one provider key. Missing keys aren't fatal — models whose key
 is absent are recorded as errors and skipped in the aggregation, so you can
 benchmark a single provider.
@@ -88,14 +93,30 @@ browser over every response.
 ```bash
 python run_bench.py --list-models          # registry + which keys are set
 python run_bench.py --dry-run              # exercise the pipeline, zero API calls
+                                           # (generation AND judging are skipped)
 python run_bench.py --models gpt-4o claude-opus-5
 python run_bench.py --judge gpt-4o-mini    # override the judge
 python run_bench.py --no-score             # collect raw answers, grade later
-python run_bench.py --temperature 0.7 --max-tokens 1024
+python run_bench.py --temperature 0.7 --max-tokens 2048
 
 python leaderboard.py --latest-only        # ignore older runs
 python leaderboard.py --no-chart
 ```
+
+## Tests
+
+```bash
+pip install pytest
+pytest
+```
+
+72 tests, **fully offline** — no API key, no network. A local mock API
+(`tests/mock_api.py`) stands in for all three vendors, so the real `anthropic`,
+`openai` and `google-genai` clients build requests, speak HTTP and parse
+responses exactly as they would against the live services. The suite covers the
+registry, all three provider adapters, retry classification, judge and heuristic
+scoring, aggregation, chart and summary generation, and the full pipeline
+end-to-end.
 
 ## Adding prompts
 
@@ -180,7 +201,8 @@ bullshit-bench/
 ├── scorer.py                # LLM-as-judge + heuristic fallback
 ├── run_bench.py             # queries models, scores, writes run_<timestamp>.json
 ├── leaderboard.py           # aggregates -> CSV + PNG + summary.md
-└── app.py                   # Streamlit dashboard
+├── app.py                   # Streamlit dashboard
+└── tests/                   # offline suite; mock_api.py stands in for the vendors
 ```
 
 `providers.py` isn't in the original spec — it exists so `run_bench.py` and
@@ -190,7 +212,15 @@ touching core logic" true.
 ## Notes and caveats
 
 - **Cost.** A default run is 16 prompts × 3 models = 48 generation calls plus 48
-  judge calls. Start with `--dry-run` to check the plumbing, then one model.
+  judge calls. `--dry-run` costs nothing at all — it skips generation *and*
+  judging (the judge is a billable call too) and grades with the heuristic.
+- **Truncation is an error, not a zero.** Models that think by default spend
+  `max_tokens` on reasoning before any visible text. If a reply comes back with
+  no text, it is recorded as a failure rather than scored 0/10 — grading an empty
+  string would invent a result. Raise `--max-tokens` (default 2048) if you see
+  `EmptyResponse`.
+- **A model that fails every call is listed separately**, not silently dropped
+  from the ranking.
 - **Retries.** Failures back off exponentially with jitter (5 attempts). Missing
   API keys and missing SDKs are *not* retried — they can't succeed on attempt 2.
 - **The judge is a model too.** It has its own biases, and a model may score
