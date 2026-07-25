@@ -90,6 +90,13 @@ don't turn into a wall of retries. Tune with `--delay`.
 
 **3. Paid APIs.** OpenAI, Anthropic, Google, DeepSeek, Mistral, Together, xAI.
 
+### What happens with no key and no local server
+
+The benchmark cannot invent answers, so every call is recorded as a failure and
+the leaderboard tells you why and what to do about it — in about two seconds, not
+after minutes of connection retries. `--dry-run` still exercises the entire
+pipeline and produces all three artifacts.
+
 ### Platform references
 
 Any model on any supported platform works without editing the registry, using
@@ -158,7 +165,7 @@ pip install pytest
 pytest
 ```
 
-103 tests, **fully offline** — no API key, no network. A local mock API
+109 tests, **fully offline** — no API key, no network. A local mock API
 (`tests/mock_api.py`) stands in for all three vendors, so the real `anthropic`,
 `openai` and `google-genai` clients build requests, speak HTTP and parse
 responses exactly as they would against the live services. The suite covers the

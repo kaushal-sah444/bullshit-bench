@@ -48,6 +48,7 @@ _NON_RETRYABLE = (
     providers.MissingDependency,
     providers.UnknownModel,
     providers.EmptyResponse,
+    providers.EndpointUnreachable,
 )
 
 

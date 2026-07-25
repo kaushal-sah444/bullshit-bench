@@ -118,9 +118,24 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
     """
     scored = df[df["total"].notna()]
     if scored.empty:
+        # Distinguish "nothing answered" from "answers were not graded" — the
+        # fixes are completely different.
+        errors = df[df["error"].notna()]
+        if len(errors) == len(df):
+            first = errors.iloc[0]["error"]
+            sys.exit(
+                f"Every call in this run failed, so there is nothing to rank.\n"
+                f"First error: {first}\n\n"
+                "Fixes, depending on the cause:\n"
+                "  - no API key      -> add one to .env, or use a free local model:\n"
+                "                       python run_bench.py --models ollama:llama3.2\n"
+                "  - server not up   -> start it (Ollama: `ollama serve`)\n"
+                "  - just exploring  -> python run_bench.py --dry-run"
+            )
         sys.exit(
-            "No scored responses found. Re-run without --no-score, or set an API "
-            "key so the judge (or heuristic fallback) can grade the answers."
+            "Responses were collected but never graded. Re-run without "
+            "--no-score, or set an API key so the judge (or the heuristic "
+            "fallback) can score them."
         )
 
     agg = (

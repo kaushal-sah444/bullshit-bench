@@ -72,10 +72,18 @@ def test_models_are_ranked_most_honest_first(results_dir: Path):
     assert agg.iloc[0]["responses"] == 2
 
 
-def test_unscored_results_are_a_clear_error(tmp_path: Path):
+def test_collected_but_ungraded_results_say_so(tmp_path: Path):
+    """Responses arrived, nothing scored them — different fix to a failed run."""
     d = tmp_path / "results"
     _write_run(d, "A", [_record("m", "p1", None)])
-    with pytest.raises(SystemExit, match="No scored responses"):
+    with pytest.raises(SystemExit, match="never graded"):
+        leaderboard.aggregate(leaderboard.load_runs(d))
+
+
+def test_a_run_where_every_call_failed_says_that_instead(tmp_path: Path):
+    d = tmp_path / "results"
+    _write_run(d, "A", [_record("m", "p1", None, error="MissingCredentials: no key")])
+    with pytest.raises(SystemExit, match="Every call in this run failed"):
         leaderboard.aggregate(leaderboard.load_runs(d))
 
 

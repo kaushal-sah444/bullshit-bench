@@ -148,6 +148,67 @@ def test_a_reachable_local_server_becomes_the_judge_when_no_keys_exist(local_ser
     assert scorer.resolve_judge() == "ollama-llama3.2"
 
 
+def test_a_dead_local_server_fails_fast_with_an_actionable_message(monkeypatch):
+    """The common beginner case: no key, and Ollama isn't running.
+
+    This must be one quick error, not minutes of connection retries.
+    """
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")  # nothing listens
+    providers._reachable_cache.clear()  # noqa: SLF001
+
+    with pytest.raises(providers.EndpointUnreachable) as exc:
+        providers.generate("ollama:llama3.2", "hi")
+
+    message = str(exc.value)
+    assert "Nothing is listening" in message
+    assert "ollama serve" in message  # tells them how to fix it
+    assert "OLLAMA_BASE_URL" in message
+
+
+def test_an_unreachable_server_is_not_retried(monkeypatch):
+    """Backing off five times cannot start a server that is not running."""
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")
+    providers._reachable_cache.clear()  # noqa: SLF001
+    monkeypatch.setattr(run_bench.time, "sleep", lambda _s: None)
+
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        return providers.generate("ollama:llama3.2", "hi")
+
+    with pytest.raises(providers.EndpointUnreachable):
+        run_bench.with_retry(attempt, description="t", verbose=False)
+    assert calls["n"] == 1
+
+
+def test_a_whole_run_against_a_dead_server_still_finishes(monkeypatch, tmp_path):
+    """Every prompt errors, the run completes, and the file is written."""
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")
+    providers._reachable_cache.clear()  # noqa: SLF001
+
+    run = run_bench.run_benchmark(["ollama:llama3.2"], run_bench.load_prompts()[:3])
+    assert all("EndpointUnreachable" in r["error"] for r in run["records"])
+    assert run_bench.save_run(run, tmp_path).exists()
+
+
+def test_the_leaderboard_explains_a_run_where_everything_failed(monkeypatch, tmp_path):
+    """The message must point at the cause, not blame scoring."""
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")
+    providers._reachable_cache.clear()  # noqa: SLF001
+    import leaderboard
+
+    run = run_bench.run_benchmark(["ollama:llama3.2"], run_bench.load_prompts()[:2])
+    run_bench.save_run(run, tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        leaderboard.aggregate(leaderboard.load_runs(tmp_path))
+
+    message = str(exc.value)
+    assert "Every call in this run failed" in message
+    assert "--dry-run" in message  # offers a way forward
+
+
 def test_an_unreachable_local_server_falls_back_to_the_heuristic(monkeypatch):
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "JUDGE_MODEL"):
         monkeypatch.delenv(var, raising=False)

@@ -46,6 +46,15 @@ class UnknownModel(ProviderError):
     """The requested model key is not in the registry."""
 
 
+class EndpointUnreachable(ProviderError):
+    """A keyless local endpoint is not accepting connections.
+
+    Almost always means the server simply is not running. Deterministic, so it
+    is not retried: backing off five times cannot start Ollama for you, and
+    doing so wastes minutes per model before the real message appears.
+    """
+
+
 class EmptyResponse(ProviderError):
     """The call succeeded but carried no usable text.
 
@@ -467,6 +476,49 @@ def _require_key(spec: ModelSpec) -> str:
 _clients: Dict[str, Any] = {}
 
 
+def _require_local_server(spec: ModelSpec) -> None:
+    """Fail fast, and helpfully, when a keyless local endpoint is not up.
+
+    Without this the SDK raises a connection error that the caller then retries
+    with backoff — minutes of silence per model before the user learns the
+    server simply is not running.
+    """
+    if spec.needs_key or endpoint_is_reachable(spec):
+        return
+
+    hint = f"set {spec.base_url_env}" if spec.base_url_env else "point it elsewhere"
+    raise EndpointUnreachable(
+        f"Nothing is listening at {spec.resolved_base_url()} for {spec.key!r}. "
+        f"Start the server (for Ollama: `ollama serve`, then "
+        f"`ollama pull {spec.model_id}`), or {hint} to a running one."
+    )
+
+
+def _create_completion(spec: ModelSpec, client: Any, kwargs: Dict[str, Any]):
+    """Call the endpoint, turning a dead local server into a clear error."""
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - re-raised either way
+        # A remote endpoint may be having a transient blip, which is worth
+        # retrying. A refused local port is not.
+        if not spec.needs_key and _looks_like_connection_error(exc):
+            _reachable_cache[spec.resolved_base_url() or ""] = False
+            raise EndpointUnreachable(
+                f"Could not reach {spec.resolved_base_url()} for {spec.key!r}: {exc}. "
+                "Is the server running?"
+            ) from exc
+        raise
+
+
+def _looks_like_connection_error(exc: BaseException) -> bool:
+    """Whether an SDK exception means 'nothing answered', not 'it said no'."""
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    return type(exc).__name__ in {
+        "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
+    }
+
+
 def _looks_like_bad_request(exc: BaseException) -> bool:
     """Whether an SDK exception represents a 4xx the server chose to reject."""
     status = getattr(exc, "status_code", None)
@@ -528,6 +580,10 @@ def _openai_client(spec: ModelSpec):
         kwargs: Dict[str, Any] = {"api_key": _require_key(spec)}
         if base_url:
             kwargs["base_url"] = base_url
+        if not spec.needs_key:
+            # A refused connection to a local port is final; the SDK's own
+            # connection retries only add delay before the useful error.
+            kwargs["max_retries"] = 0
         _clients[cache_key] = OpenAI(**kwargs)
     return _clients[cache_key]
 
@@ -549,6 +605,8 @@ def _call_openai(
         json_mode: Ask the endpoint to constrain output to valid JSON. Only used
             for judge calls, and only where the spec says it is supported.
     """
+    _require_local_server(spec)
+
     client = _openai_client(spec)
     kwargs: Dict[str, Any] = {
         "model": spec.model_id,
@@ -561,16 +619,14 @@ def _call_openai(
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        response = client.chat.completions.create(**kwargs)
+        response = _create_completion(spec, client, kwargs)
     except Exception as exc:  # noqa: BLE001 - narrow retry for one known case
         # Some self-hosted servers reject response_format outright. Losing JSON
         # mode is far better than losing the call.
-        if "response_format" not in kwargs:
-            raise
-        if not _looks_like_bad_request(exc):
+        if "response_format" not in kwargs or not _looks_like_bad_request(exc):
             raise
         kwargs.pop("response_format")
-        response = client.chat.completions.create(**kwargs)
+        response = _create_completion(spec, client, kwargs)
     if not response.choices:
         raise EmptyResponse(f"{spec.key} returned no choices")
 
