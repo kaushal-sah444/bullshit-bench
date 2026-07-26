@@ -14,7 +14,7 @@ honest, direct answers.
 > python run_bench.py --models ollama:llama3.2 && python leaderboard.py
 > ```
 
-Most benchmarks measure what a model knows. This one measures what it does when
+Most benchmark measure what a model knows. This one measures what it does when
 it *can't* know — when the question is about a fictional place, a paper that was
 never written, next year's Bitcoin price, or the exact number of jelly beans in a
 Honda Civic. A good model names the problem and refuses to invent specifics. A
