@@ -48,7 +48,7 @@ markers, filler openers, hedge stacking and fabricated-specificity tells (precis
 figures, `et al.`, page numbers). It is good enough to smoke-test the pipeline
 and nothing more; the `method` field on every score records which one ran.
 
-## Setup
+## Setup-
 
 ```bash
 git clone <your-repo-url>
